@@ -1,9 +1,9 @@
-import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { NestFactory } from '@nestjs/core';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { logger: false });
-
+  
   app.enableCors({
     origin: [
       'http://localhost:5173', // Vite default
@@ -14,9 +14,10 @@ async function bootstrap() {
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: false,
   });
-
+  
   const port = process.env.PORT ?? 3000;
-  await app.listen(port);
+  console.log('Environment variables:', port);
   console.log('Application was running on port', port);
+  await app.listen(port);
 }
 bootstrap();

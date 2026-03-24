@@ -25,6 +25,14 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Veo Video Extension Endpoints
+
+This service exposes Veo (video model) operations under the `gemini` route.
+
+- `POST /gemini/scenes-and-extend` and `POST /gemini/extend` (same behavior)
+  Body: `{ content: string, aspectRatio?: "9:16"|"16:9" }`
+  Converts `content` into scenes, generates the first Veo segment (max duration), then extends in a chain to ~2 minutes. Saves the final MP4 as `generated/{completionTimestampMs}.mp4`.
+
 ## Project setup
 
 ```bash

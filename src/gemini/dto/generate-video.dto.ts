@@ -21,3 +21,13 @@ export class GenerateVideoMontageDto {
     @IsIn(["9:16", "16:9"])
     aspectRatio?: "9:16" | "16:9";
   }
+
+export class GenerateScenesAndExtendToTwoMinutesDto {
+  @IsString()
+  @MinLength(5)
+  content: string;
+
+  @IsOptional()
+  @IsIn(["9:16", "16:9"])
+  aspectRatio?: "9:16" | "16:9";
+}
