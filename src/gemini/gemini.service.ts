@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Modality } from "@google/genai";
 import * as path from "path";
 import * as fs from "fs/promises";
 import { spawn } from "child_process";
@@ -8,6 +8,10 @@ import { spawn } from "child_process";
 function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+const FLASH_IMAGE_MODEL = "gemini-2.5-flash-image";
+const IMAGEN_GENERATE_MODEL = "imagen-3.0-generate-002";
+const VEO_MODEL = "veo-3.1-generate-preview";
 
 @Injectable()
 export class GeminiService {
@@ -340,6 +344,291 @@ export class GeminiService {
             combinedFilePath,
             combinedFileName,
             clipFiles,
+        };
+    }
+
+    /**
+     * One shared visual bible reused for every keyframe so scenes stay stylistically consistent.
+     */
+    async geminiVisualStyleBrief(content: string, scenes: string[]): Promise<string> {
+        const systemInstruction = `You write a single compact "visual style bible" (about 120–200 words) for an educational video series.
+        Lock these across all episodes/frames: color palette, lighting approach, realism level, recurring characters or subjects (if any), wardrobe/props consistency, environment tone, and lens/camera language.
+        Do not narrate the lesson step-by-step. Do not number scenes. Plain text only, no markdown.`;
+
+        const user = `Original instructional content:\n\n${content}\n\nScene prompts (context only):\n${JSON.stringify(scenes)}`;
+
+        const result: any = await this.ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: [{ role: "user", parts: [{ text: user }] }],
+            config: {
+                temperature: 0.65,
+                maxOutputTokens: 1024,
+                systemInstruction,
+            },
+        });
+
+        const text = result?.text?.trim?.() ?? "";
+        if (!text) {
+            throw new Error("geminiVisualStyleBrief: empty response from Gemini.");
+        }
+        console.log("[scene-image-montage] Step complete: visual style brief generated.");
+        return text;
+    }
+
+    private extractImageBytesFromModelResponse(res: any): { base64: string; mimeType: string } {
+        const gi = res?.generatedImages?.[0]?.image;
+        if (gi?.imageBytes) {
+            return { base64: String(gi.imageBytes), mimeType: gi.mimeType || "image/png" };
+        }
+        const parts = res?.candidates?.[0]?.content?.parts ?? [];
+        for (const p of parts) {
+            if (p?.inlineData?.data) {
+                return { base64: String(p.inlineData.data), mimeType: p.inlineData.mimeType || "image/png" };
+            }
+        }
+        throw new Error("Image model returned no image bytes.");
+    }
+
+    private async generateSceneKeyframeFlashImage(args: {
+        sceneIndex: number;
+        total: number;
+        scenePrompt: string;
+        styleBrief: string;
+        referenceBase64?: string;
+        referenceMime?: string;
+        aspectRatio: "9:16" | "16:9";
+    }): Promise<{ base64: string; mimeType: string }> {
+        const { sceneIndex, total, scenePrompt, styleBrief, referenceBase64, referenceMime, aspectRatio } = args;
+
+        const header = `Educational video keyframe, photorealistic cinematic still. Scene ${sceneIndex + 1} of ${total}.
+
+        STYLE BIBLE (must stay consistent across every image in this series):
+        ${styleBrief}
+
+        SHOT / SCENE:
+        ${scenePrompt}
+
+        Single frame only. No subtitles, no on-screen text, no split panels.`;
+
+        const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
+        if (referenceBase64) {
+            parts.push({
+                inlineData: {
+                    mimeType: referenceMime || "image/png",
+                    data: referenceBase64,
+                },
+            });
+            parts.push({
+                text: `The attached image is the series visual anchor. Match its characters, wardrobe, props, palette, lighting mood, and production design. Create a NEW keyframe for the shot below (new composition; same world).
+
+${header}`,
+            });
+        } else {
+            parts.push({ text: header });
+        }
+
+        const res: any = await this.ai.models.generateContent({
+            model: FLASH_IMAGE_MODEL,
+            contents: [{ role: "user", parts }],
+            config: {
+                responseModalities: [Modality.IMAGE],
+                imageConfig: { aspectRatio },
+            },
+        });
+
+        const out = this.extractImageBytesFromModelResponse(res);
+        console.log(
+            `[scene-image-montage] Step complete: flash keyframe generated (scene ${args.sceneIndex + 1}/${args.total}).`,
+        );
+        return out;
+    }
+
+    private async generateSceneKeyframeImagen(
+        prompt: string,
+        aspectRatio: "9:16" | "16:9",
+        sceneMeta?: { index1Based: number; total: number },
+    ): Promise<{ base64: string; mimeType: string }> {
+        const res = await this.ai.models.generateImages({
+            model: IMAGEN_GENERATE_MODEL,
+            prompt,
+            config: {
+                numberOfImages: 1,
+                aspectRatio,
+                outputMimeType: "image/png",
+            },
+        });
+
+        const first = res?.generatedImages?.[0];
+        const img = first?.image;
+        if (!img?.imageBytes) {
+            const rai = first?.raiFilteredReason;
+            throw new Error(`Imagen did not return an image.${rai ? ` RAI: ${rai}` : ""}`);
+        }
+        const out = { base64: String(img.imageBytes), mimeType: img.mimeType || "image/png" };
+        if (sceneMeta) {
+            console.log(
+                `[scene-image-montage] Step complete: Imagen keyframe generated (scene ${sceneMeta.index1Based}/${sceneMeta.total}).`,
+            );
+        } else {
+            console.log("[scene-image-montage] Step complete: Imagen keyframe generated.");
+        }
+        return out;
+    }
+
+    private async pollVideoOperationUntilDone(operation: any, label: string) {
+        const maxAttempts = 120;
+        let attempt = 0;
+        let op = operation;
+        while (!op.done) {
+            attempt += 1;
+            if (attempt > maxAttempts) {
+                throw new Error(`${label}: Veo generation timed out while polling operation status.`);
+            }
+            await sleep(10_000);
+            op = await this.ai.operations.getVideosOperation({ operation: op });
+        }
+        console.log(`[scene-image-montage] Step complete: Veo operation finished (${label}).`);
+        return op;
+    }
+
+    /**
+     * content → scenes → shared style brief → keyframe images (folder) → image-to-video per scene → concat (same as montage).
+     */
+    async generateSceneImageMontageFromContent(content: string, aspectRatio: "9:16" | "16:9" = "9:16") {
+        console.log("[scene-image-montage] Pipeline start: scene-with-images montage.");
+        const outDir = path.resolve(process.cwd(), "generated");
+        await fs.mkdir(outDir, { recursive: true });
+        console.log("[scene-image-montage] Step complete: output directory ready.", outDir);
+
+        const scenes = await this.geminiVideoScript(content);
+        if (!scenes.length) {
+            throw new Error("No scenes produced from content.");
+        }
+        console.log(
+            `[scene-image-montage] Step complete: video script / scenes generated (count=${scenes.length}).`,
+        );
+
+        const styleBrief = await this.geminiVisualStyleBrief(content, scenes);
+        console.log(
+            `[scene-image-montage] Step complete: style brief ready (length=${styleBrief.length} chars).`,
+        );
+
+        const montageId = `montage_img_${Date.now()}`;
+        const montageDir = path.join(outDir, montageId);
+        const imagesDir = path.join(montageDir, "images");
+        await fs.mkdir(imagesDir, { recursive: true });
+        console.log("[scene-image-montage] Step complete: montage workspace created.", { montageDir, imagesDir });
+
+        const imagePaths: string[] = [];
+        let anchorBase64: string | undefined;
+        let anchorMime = "image/png";
+
+        console.log(`[scene-image-montage] Phase: generating ${scenes.length} keyframe images...`);
+        for (let i = 0; i < scenes.length; i++) {
+            let packed: { base64: string; mimeType: string };
+            try {
+                packed = await this.generateSceneKeyframeFlashImage({
+                    sceneIndex: i,
+                    total: scenes.length,
+                    scenePrompt: scenes[i].trim(),
+                    styleBrief,
+                    referenceBase64: anchorBase64,
+                    referenceMime: anchorMime,
+                    aspectRatio,
+                });
+            } catch (err: any) {
+                console.warn(
+                    `[scene-image-montage] flash-image failed scene ${i + 1}, falling back to Imagen:`,
+                    err?.message ?? err,
+                );
+                const combined = `STYLE BIBLE (keep consistent):\n${styleBrief}\n\nScene ${i + 1} of ${scenes.length} — cinematic educational keyframe, no text overlays:\n${scenes[i].trim()}`;
+                packed = await this.generateSceneKeyframeImagen(combined, aspectRatio, {
+                    index1Based: i + 1,
+                    total: scenes.length,
+                });
+            }
+
+            if (anchorBase64 === undefined) {
+                anchorBase64 = packed.base64;
+                anchorMime = packed.mimeType;
+                console.log("[scene-image-montage] Step complete: visual anchor set from first keyframe.");
+            }
+
+            const ext =
+                packed.mimeType.includes("jpeg") || packed.mimeType.includes("jpg") ? "jpg" : "png";
+            const imagePath = path.join(imagesDir, `scene_${String(i + 1).padStart(2, "0")}.${ext}`);
+            await fs.writeFile(imagePath, Buffer.from(packed.base64, "base64"));
+            imagePaths.push(imagePath);
+            console.log(
+                `[scene-image-montage] Step complete: keyframe ${i + 1}/${scenes.length} saved to disk -> ${imagePath}`,
+            );
+        }
+        console.log("[scene-image-montage] Phase complete: all keyframe images written.");
+
+        const clipFiles = scenes.map((_, i) =>
+            path.join(montageDir, `clip_${String(i + 1).padStart(2, "0")}.mp4`),
+        );
+
+        const ar = aspectRatio as "9:16" | "16:9";
+        console.log(`[scene-image-montage] Phase: generating ${scenes.length} Veo clips from keyframes...`);
+        for (let i = 0; i < scenes.length; i++) {
+            const imageBuf = await fs.readFile(imagePaths[i]);
+            const imageBytes = imageBuf.toString("base64");
+            const mimeType = imagePaths[i].toLowerCase().endsWith(".jpg")
+                ? "image/jpeg"
+                : "image/png";
+
+            const videoPrompt = `Scene ${i + 1} of ${scenes.length}. Animate this keyframe with cinematic motion; keep subjects and style faithful to the image. ${scenes[i].trim()}`;
+
+            console.log(`[scene-image-montage] Starting Veo clip ${i + 1}/${scenes.length}...`);
+            let operation = await this.ai.models.generateVideos({
+                model: VEO_MODEL,
+                prompt: videoPrompt,
+                image: { imageBytes, mimeType },
+                config: { aspectRatio: ar, resolution: "720p", numberOfVideos: 1 },
+            });
+
+            operation = await this.pollVideoOperationUntilDone(operation, `clip ${i + 1}`);
+            const generated = operation.response?.generatedVideos?.[0];
+            if (!generated?.video) {
+                throw new Error(`No generated video in response for clip ${i + 1}.`);
+            }
+
+            await this.ai.files.download({
+                file: generated.video,
+                downloadPath: clipFiles[i],
+            });
+            console.log(
+                `[scene-image-montage] Step complete: clip ${i + 1}/${scenes.length} downloaded -> ${clipFiles[i]}`,
+            );
+        }
+        console.log("[scene-image-montage] Phase complete: all Veo clips saved.");
+
+        const combinedFileName = `${montageId}.mp4`;
+        const combinedFilePath = path.join(outDir, combinedFileName);
+
+        console.log("[scene-image-montage] Phase: stitching clips with FFmpeg...");
+        try {
+            await this.concatClipsFFmpeg(clipFiles, combinedFilePath);
+            console.log("[scene-image-montage] Step complete: FFmpeg concat (stream copy) succeeded.");
+        } catch {
+            console.log("[scene-image-montage] Stream copy concat failed; falling back to re-encode concat.");
+            await this.concatClipsFFmpegReencode(clipFiles, combinedFilePath);
+            console.log("[scene-image-montage] Step complete: FFmpeg re-encode concat succeeded.");
+        }
+
+        console.log("[scene-image-montage] Pipeline complete: final montage ->", combinedFilePath);
+
+        return {
+            combinedFilePath,
+            combinedFileName,
+            clipFiles,
+            imagePaths,
+            imagesDir,
+            montageDir,
+            montageId,
+            scenes,
+            styleBrief,
         };
     }
 }

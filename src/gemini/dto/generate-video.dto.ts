@@ -21,3 +21,14 @@ export class GenerateVideoMontageDto {
     @IsIn(["9:16", "16:9"])
     aspectRatio?: "9:16" | "16:9";
   }
+
+/** Same body shape as a text-only scene montage, but runs image keyframes then image-to-video. */
+export class SceneImageMontageDto {
+  @IsString()
+  @MinLength(5)
+  content: string;
+
+  @IsOptional()
+  @IsIn(["9:16", "16:9"])
+  aspectRatio?: "9:16" | "16:9";
+}

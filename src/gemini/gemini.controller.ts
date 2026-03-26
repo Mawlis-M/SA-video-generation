@@ -1,8 +1,6 @@
 import { Body, Controller, Post } from "@nestjs/common";
 import { GeminiService } from "./gemini.service";
-import { GenerateVideoDto, GenerateVideoMontageDto } from "./dto/generate-video.dto";
-import * as path from "path";
-import * as fs from "fs/promises";
+import { GenerateVideoMontageDto, SceneImageMontageDto } from "./dto/generate-video.dto";
 
 @Controller("gemini")
 export class GeminiController {
@@ -27,5 +25,17 @@ export class GeminiController {
     console.log("scenes", scenes);
     const result = await this.gemini.generateMontageToFile(scenes, reqparams.aspectRatio ?? "9:16");
     return result; // { filePath, fileName }
+  }
+
+  /**
+   * content → scenes → shared style brief → per-scene keyframe images (under generated/.../images/)
+   * → Veo image-to-video per scene → FFmpeg concat (same output shape as /scene plus image paths).
+   */
+  @Post("scene-with-images")
+  async sceneWithImages(@Body() dto: SceneImageMontageDto) {
+    return await this.gemini.generateSceneImageMontageFromContent(
+      dto.content,
+      dto.aspectRatio ?? "9:16",
+    );
   }
 }
