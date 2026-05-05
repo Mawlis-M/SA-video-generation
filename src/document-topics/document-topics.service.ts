@@ -10,6 +10,7 @@ import * as mammoth from "mammoth";
 import { PDFParse } from "pdf-parse";
 
 const DEFAULT_TOPIC_MODEL = "gpt-5";
+const DEFAULT_SUMMARY_MODEL = "gpt-5";
 const TOPIC_SCHEMA = {
   name: "topic_segmentation",
   schema: {
@@ -41,6 +42,8 @@ export class DocumentTopicsService {
   private readonly openaiApiKey?: string;
   private readonly topicModel: string;
   private readonly fallbackTopicModels: string[];
+  private readonly summaryModel: string;
+  private readonly fallbackSummaryModels: string[];
 
   constructor(private readonly config: ConfigService) {
     const apiKey =
@@ -59,6 +62,18 @@ export class DocumentTopicsService {
       .split(",")
       .map((v) => v.trim())
       .filter((v) => !!v && v !== this.topicModel);
+    this.summaryModel =
+      this.config.get<string>("OPENAI_SUMMARY_MODEL") ||
+      process.env.OPENAI_SUMMARY_MODEL ||
+      DEFAULT_SUMMARY_MODEL;
+    const fallbackSummaryFromEnv =
+      this.config.get<string>("OPENAI_SUMMARY_MODEL_FALLBACKS") ||
+      process.env.OPENAI_SUMMARY_MODEL_FALLBACKS ||
+      "gpt-4.1";
+    this.fallbackSummaryModels = fallbackSummaryFromEnv
+      .split(",")
+      .map((v) => v.trim())
+      .filter((v) => !!v && v !== this.summaryModel);
   }
 
   async extractPlainText(
@@ -91,7 +106,7 @@ export class DocumentTopicsService {
 
     if (
       mime ===
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
       ext === ".docx"
     ) {
       console.log("[DocumentTopics] parser selected: docx (mammoth)");
@@ -311,7 +326,99 @@ Rules:
     };
   }
 
-  async analyzeTopics( file: Express.Multer.File | undefined) {
+  async summarizePlainText(plainText: string): Promise<string> {
+    if (!plainText) {
+      throw new BadRequestException("No text could be extracted from the file.");
+    }
+    if (!this.openaiApiKey) {
+      throw new InternalServerErrorException(
+        "OPENAI_API_KEY is missing. Add it to your environment before generating a summary.",
+      );
+    }
+
+    const candidateModels = [this.summaryModel, ...this.fallbackSummaryModels];
+    const systemInstruction = `
+You produce a detailed instructional summary of an entire document for use in educational or demonstration video generation.
+
+Rules:
+1. Return plain text only (no JSON, no markdown, no bullet symbols).
+2. Cover the full document — do not skip sections, chapters, or topics. Every major section must be represented.
+3. For each section or topic, write a dedicated paragraph that explains: the purpose of that section, the key steps or concepts involved, any warnings, safety notes, or prerequisites, and the expected outcome or result.
+4. Preserve the original document's order and structure so the video can follow the same sequence.
+5. Use clear, action-oriented language written as if narrating or explaining to a viewer watching a demonstration.
+6. Remove only exact duplicate content — near-similar steps that appear in different contexts should still be described separately if they serve a different purpose.
+7. Do not invent, assume, or expand on facts not present in the document.
+8. Do not summarize multiple distinct topics into one paragraph — keep each topic or section as its own focused block.
+9. Length must reflect the document's depth. A short document (1–5 pages) should produce 400–700 words. A medium document (6–20 pages) should produce 700–1500 words. A long document such as a user manual or technical guide (20+ pages) should produce 1500–3000 words or more as needed to fully represent all content.
+10. Terminology must remain accurate and consistent with the source document throughout.
+`.trim();
+
+    let finalSummary = "";
+    let usedModel = this.summaryModel;
+    let lastError: unknown;
+
+    for (const modelName of candidateModels) {
+      usedModel = modelName;
+      try {
+        const response = await this.openai.responses.create({
+          model: modelName,
+          temperature: 0.2,
+          max_output_tokens: 3500,
+          input: [
+            { role: "system", content: systemInstruction },
+            {
+              role: "user",
+              content: `Summarize this document for cinematic educational scene generation:\n\n${plainText}`,
+            },
+          ],
+        });
+
+        finalSummary =
+          (response as { output_text?: string })?.output_text?.trim() ?? "";
+
+        if (finalSummary) {
+          break;
+        }
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    if (!finalSummary) {
+      const modelErrorMessage = lastError instanceof Error ? lastError.message : "";
+      if (
+        modelErrorMessage.includes("model") &&
+        (modelErrorMessage.includes("not found") ||
+          modelErrorMessage.includes("do not have access"))
+      ) {
+        throw new InternalServerErrorException(
+          `Summary model is unavailable (${usedModel}). Set OPENAI_SUMMARY_MODEL to a model your key can access, for example gpt-4.1.`,
+        );
+      }
+      throw new InternalServerErrorException(
+        "Document summarization failed before a usable response was produced.",
+      );
+    }
+
+    return finalSummary;
+  }
+
+  async summarizeUploadedDocument(
+    buffer: Buffer,
+    mimeType: string,
+    originalName: string,
+  ) {
+    const text = await this.extractPlainText(buffer, mimeType, originalName);
+    const summary = await this.summarizePlainText(text);
+    return {
+      originalFileName: originalName,
+      extractedTextLength: text.length,
+      summaryTextLength: summary.length,
+      summary,
+    };
+  }
+
+  async analyzeTopics(file: Express.Multer.File | undefined) {
     console.log("[DocumentTopics] /documents/analyze-topics request received");
     if (!file?.buffer?.length) {
       console.log("[DocumentTopics] request rejected: missing or empty file");

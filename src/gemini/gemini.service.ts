@@ -1,6 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { GoogleGenAI, Modality } from "@google/genai";
+import OpenAI from "openai";
 import * as path from "path";
 import * as fs from "fs/promises";
 import { spawn } from "child_process";
@@ -9,9 +10,27 @@ function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** OpenAI Responses API: prefer `output_text`, fall back to message content parts (same pattern as document-topics). */
+function extractOpenAIResponseOutputText(response: unknown): string {
+    const r = response as {
+        output_text?: string;
+        output?: { content?: { text?: string; type?: string }[] }[];
+    };
+    const top = r?.output_text?.trim();
+    if (top) return top;
+    const nested =
+        r?.output
+            ?.flatMap((item) => item.content ?? [])
+            .filter((part) => part.type === "output_text" && !!part.text)
+            .map((part) => part.text ?? "")
+            .join("") ?? "";
+    return nested.trim();
+}
+
 const FLASH_IMAGE_MODEL = "gemini-2.5-flash-image";
 const IMAGEN_GENERATE_MODEL = "imagen-3.0-generate-002";
 const VEO_MODEL = "veo-3.1-generate-preview";
+const OPENAI_SCENE_MODEL = "gpt-5";
 
 /** Veo sometimes returns INTERNAL (gRPC 13) on a finished LRO; short backoff + full clip retry usually succeeds. */
 const VEO_MONTAGE_CLIP_MAX_ATTEMPTS = 5;
@@ -32,6 +51,13 @@ export type SceneImageMontageFailureDetails = {
     originalErrorMessage: string;
 };
 
+export type SceneImageMontageResumeOptions = {
+    /** Reuse an existing montage workspace folder id, e.g. `montage_img_1777...`. */
+    resumeMontageId?: string;
+    /** 1-based scene index to resume from. Example: 26 means continue from scene_26 / clip_26. */
+    resumeFromScene?: number;
+};
+
 export class SceneImageMontageError extends Error {
     readonly details: SceneImageMontageFailureDetails;
 
@@ -45,14 +71,22 @@ export class SceneImageMontageError extends Error {
 @Injectable()
 export class GeminiService {
     private readonly ai: GoogleGenAI;
+    private readonly openai: OpenAI;
+    private readonly sceneModel: string;
     private ffmpegChecked = false;
     private ffmpegAvailable = false;
 
     constructor(private readonly config: ConfigService) {
         const apiKey = this.config.get<string>("GEMINI_API_KEY") || this.config.get<string>("GOOGLE_API_KEY") || process.env.GEMINI_API_KEY;
+        const openaiApiKey = this.config.get<string>("OPENAI_API_KEY") || process.env.OPENAI_API_KEY;
         // If you prefer env auto-pickup, you can do new GoogleGenAI({})
         // but being explicit is clearer for NestJS server apps.
         this.ai = new GoogleGenAI(apiKey ? { apiKey } : {});
+        this.openai = new OpenAI({ apiKey: openaiApiKey });
+        this.sceneModel =
+            this.config.get<string>("OPENAI_SCENE_MODEL") ||
+            process.env.OPENAI_SCENE_MODEL ||
+            OPENAI_SCENE_MODEL;
     }
 
     /**
@@ -100,80 +134,114 @@ export class GeminiService {
         const systemInstruction = `
     You are an expert cinematic educational scene designer.
 
-        Your task is to convert LMS instructional content into structured scene-based video prompts.
+Your task is to convert a detailed instructional summary into structured scene-based video prompts for educational or demonstration videos.
 
-        Output Requirements:
+Output Requirements:
 
-        1. Return ONLY a valid JSON array of strings.
-        2. Do NOT wrap in markdown code fences.
-        3. Do NOT return an object. Do NOT include keys.
-        4. Each string must describe ONE visual scene.
-        5. Each scene must be cinematic, visually descriptive, realistic, and suitable for AI video generation.
-        6. Include environment details (lab, classroom, outdoor, etc.).
-        7. Mention lighting (natural light, soft lighting, warm classroom light, etc.).
-        8. Add camera movement (slow zoom, macro shot, close-up, wide shot, tracking shot, etc.).
-        9. Maintain an educational tone.
-        10. Optionally include subtle background narration style such as:
-        - calm instructional voice-over
-        - clear educational explanation tone
-        - steady classroom narration
-        11. Do NOT include spoken dialogue between characters.
-        12. Keep scenes visually rich but concise.
-        13. Ensure the flow logically follows the instructional steps.
-        14. Create 5–8 scenes depending on complexity. Each scene will create a single clip which has a length of 8 seconds, So try to fit the scenes which could last for a minimum of 1 minute and not exceed 2 minutes .  
+1. Return ONLY a valid JSON array of strings.
+2. Do NOT wrap in markdown code fences.
+3. Do NOT return an object. Do NOT include keys.
+4. Each string must describe ONE visual scene covering a single instructional step, concept, or topic segment.
+5. Each scene must be cinematic, visually descriptive, realistic, and suitable for AI video generation.
+6. Include environment details relevant to the content (lab, classroom, workshop, office, outdoor field, factory floor, etc.).
+7. Mention lighting conditions appropriate to the setting (natural daylight, soft diffused lab lighting, warm overhead classroom light, cool industrial lighting, etc.).
+8. Add a camera movement or shot type for every scene (slow zoom in, macro close-up, wide establishing shot, tracking shot alongside subject, overhead bird's-eye, eye-level medium shot, pull-back reveal, etc.).
+9. Maintain a clear educational and demonstration tone throughout.
+10. Each scene may include a subtle narration style cue such as:
+    - calm instructional voice-over
+    - clear step-by-step explanation tone
+    - steady professional demonstration narration
+    - focused technical commentary tone
+11. Do NOT include spoken dialogue between characters.
+12. Keep each scene description visually rich but focused on one idea or action.
+13. Scenes must follow the exact logical and sequential order of the instructional summary provided.
+14. Do NOT collapse multiple distinct steps or topics into one scene. Each major step, warning, or outcome deserves its own scene.
+15. Scene count must reflect the depth and length of the summary:
+    - Short summary (400–700 words): Generate 8–12 scenes.
+    - Medium summary (700–1500 words): Generate 12–20 scenes.
+    - Long summary (1500–3000+ words): Generate 20–35 scenes or more as needed.
+16. Each scene represents exactly one 8-second video clip. When writing each scene description, mentally pace the action and visuals to confirm they fit naturally within 8 seconds — not rushed, not lingering. Apply these guidelines:
+    - A single focused action (adjusting a knob, placing a sample, pouring a liquid) fits one 8-second scene.
+    - If a step involves multiple distinct actions or transitions that would feel rushed or incomplete in 8 seconds, split it into two or more separate scenes without hesitation.
+    - If a concept or visual is simple and resolved quickly, keep it as one scene — do not pad or stretch.
+    - Never compress two full actions into one scene just to reduce scene count.
+    - Always prioritize timing accuracy over scene count targets. If the content demands 40 scenes to cover everything at a proper 8-second pace, generate 40 scenes.
+    - As a general pacing reference: one calm deliberate action, one camera movement, and one environmental detail = approximately 8 seconds of screen time.
+17. Never truncate the summary content to fit a scene limit. Scene count must expand to cover all instructional content completely.
 
-        Output Example:
+Output Example:
 
-        [
-        "Scene description with cinematic visuals and calm educational voice-over tone...",
-        "Next scene..."
-        ]
+[
+  "Wide establishing shot of a clean university biology lab with rows of equipment under soft white fluorescent lighting. A student in a lab coat carefully prepares sample slides at a workstation. Calm instructional voice-over tone.",
+  "Macro close-up shot of gloved hands placing a thin tissue sample onto a glass slide under warm task lighting. The motion is slow and deliberate. Clear step-by-step explanation tone.",
+  "Medium eye-level shot of the student adjusting the focus knob on a compound microscope. The background shows blurred lab equipment. Steady professional demonstration narration.",
+  "Next scene..."
+]
       `;
 
         let lastError: unknown;
 
         for (let attempt = 1; attempt <= GeminiService.VIDEO_SCRIPT_MAX_RETRIES; attempt++) {
-          try {
-            const result: any = await this.ai.models.generateContent({
-              model: "gemini-2.5-flash",
-              contents: [{ role: "user", parts: [{ text: content }] }],
-              config: {
-                temperature: 0.8,
-                topP: 0.9,
-                maxOutputTokens: 8192,
-                systemInstruction,
-                responseMimeType: "application/json",
-              },
-            });
+            try {
+                const result = await this.openai.responses.create({
+                    model: this.sceneModel,
+                    // Long summaries ask for many verbose scenes; 8k tokens often truncates mid-JSON → JSON.parse errors.
+                    max_output_tokens: 16_384,
+                    input: [
+                        { role: "system", content: systemInstruction },
+                        { role: "user", content },
+                    ],
+                });
 
-            const rawText =
-              result?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || "").join("") || "";
+                const rawText = extractOpenAIResponseOutputText(result);
 
-            const cleaned = rawText
-              .replace(/```json\s*/gi, "")
-              .replace(/```\s*/g, "")
-              .trim();
+                const cleaned = rawText
+                    .replace(/```json\s*/gi, "")
+                    .replace(/```\s*/g, "")
+                    .trim();
 
-            const parsed = JSON.parse(cleaned);
+                if (!cleaned) {
+                    throw new Error(
+                        "Scene model returned empty output (expected a JSON array of scene strings).",
+                    );
+                }
 
-            if (!Array.isArray(parsed) || !parsed.every((x) => typeof x === "string")) {
-              throw new Error("Gemini did not return a JSON array of strings.");
+                let parsed: unknown;
+                try {
+                    parsed = JSON.parse(cleaned);
+                } catch (parseErr) {
+                    const likelyTruncated =
+                        cleaned.startsWith("[") &&
+                        !/\]\s*$/.test(cleaned) &&
+                        cleaned.length > 100;
+                    throw new Error(
+                        likelyTruncated
+                            ? "Scene JSON looks truncated (output may have hit max_output_tokens). Try a shorter document summary or raise the token limit."
+                            : parseErr instanceof Error
+                                ? parseErr.message
+                                : String(parseErr),
+                    );
+                }
+
+                if (!Array.isArray(parsed) || !parsed.every((x) => typeof x === "string")) {
+                    throw new Error("OpenAI did not return a JSON array of strings.");
+                }
+
+                return parsed;
+            } catch (err: any) {
+                lastError = err;
+                console.warn(
+                    `[geminiVideoScript] Attempt ${attempt}/${GeminiService.VIDEO_SCRIPT_MAX_RETRIES} failed: ${err?.message}`,
+                );
+                if (attempt < GeminiService.VIDEO_SCRIPT_MAX_RETRIES) {
+                    await sleep(1000 * attempt);
+                }
             }
-
-            return parsed;
-          } catch (err: any) {
-            lastError = err;
-            console.warn(
-              `[geminiVideoScript] Attempt ${attempt}/${GeminiService.VIDEO_SCRIPT_MAX_RETRIES} failed: ${err?.message}`,
-            );
-            if (attempt < GeminiService.VIDEO_SCRIPT_MAX_RETRIES) {
-              await sleep(1000 * attempt);
-            }
-          }
         }
 
         throw lastError;
-      }
+    }
+
     async generateVideoToFile(prompt: string, aspectRatio: "9:16" | "16:9") {
         // ensure output dir exists
         const outDir = path.resolve(process.cwd(), "generated");
@@ -299,7 +367,7 @@ export class GeminiService {
      * This requires that all clips have compatible encoding params.
      * (Usually true if all generated by Veo with same aspect ratio.)
      */
-     async concatClipsFFmpeg(clipPaths: string[], outputPath: string) {
+    async concatClipsFFmpeg(clipPaths: string[], outputPath: string) {
         // Create a concat list file
         // Important: use absolute paths and escape single quotes
         const listFilePath = path.join(path.dirname(outputPath), `concat_${Date.now()}.txt`);
@@ -346,7 +414,7 @@ export class GeminiService {
      * Fallback concat that re-encodes (more compatible, slower).
      * Uses filter_complex concat.
      */
-     async concatClipsFFmpegReencode(clipPaths: string[], outputPath: string) {
+    async concatClipsFFmpegReencode(clipPaths: string[], outputPath: string) {
         await new Promise<void>((resolve, reject) => {
             // Build: -i clip1 -i clip2 ... then filter_complex concat
             const inputs: string[] = [];
@@ -785,7 +853,91 @@ ${header}`,
         return existing;
     }
 
+    private async clipFileByteSize(filePath: string): Promise<number> {
+        try {
+            const st = await fs.stat(filePath);
+            return st.size;
+        } catch {
+            return 0;
+        }
+    }
+
+    private normalizeResumeMontageId(raw?: string): string | undefined {
+        const trimmed = (raw ?? "").trim();
+        if (!trimmed) return undefined;
+        if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) {
+            throw new Error("resumeMontageId contains invalid characters.");
+        }
+        return trimmed;
+    }
+
+    private normalizeResumeFromScene(value?: number): number {
+        if (value == null) return 1;
+        if (!Number.isFinite(value)) return 1;
+        return Math.max(1, Math.floor(value));
+    }
+
+    private async resolveExistingSceneImagePath(imagesDir: string, sceneIndex1Based: number): Promise<string | null> {
+        const stem = `scene_${String(sceneIndex1Based).padStart(2, "0")}`;
+        const candidates = [`${stem}.png`, `${stem}.jpg`, `${stem}.jpeg`].map((n) => path.join(imagesDir, n));
+        for (const p of candidates) {
+            if (await this.fileExists(p)) {
+                const size = await this.clipFileByteSize(p);
+                if (size > 0) return p;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * All finished scene clips in the montage workspace (clip_01.mp4, clip_02.mp4, …), scene order.
+     * Scans the directory so partial stitch includes every clip that actually landed on disk, then fills
+     * gaps from the manifest paths (same paths in normal runs).
+     */
+    private async collectMontageWorkspaceClips(montageDir: string, clipFiles: string[]): Promise<string[]> {
+        const byScene = new Map<number, string>();
+
+        const tryAdd = async (p: string) => {
+            const base = path.basename(p);
+            const m = base.match(/^clip_(\d+)\.mp4$/i);
+            if (!m) return;
+            const idx = parseInt(m[1], 10);
+            if (!Number.isFinite(idx) || idx < 1) return;
+            const abs = path.resolve(p);
+            if (!(await this.fileExists(abs))) return;
+            if ((await this.clipFileByteSize(abs)) === 0) return;
+            if (!byScene.has(idx)) {
+                byScene.set(idx, abs);
+            }
+        };
+
+        try {
+            const names = await fs.readdir(montageDir);
+            const re = /^clip_(\d+)\.mp4$/i;
+            const hits: { n: number; full: string }[] = [];
+            for (const name of names) {
+                const match = name.match(re);
+                if (match) {
+                    hits.push({ n: parseInt(match[1], 10), full: path.join(montageDir, name) });
+                }
+            }
+            hits.sort((a, b) => a.n - b.n);
+            for (const h of hits) {
+                await tryAdd(h.full);
+            }
+        } catch {
+            // montageDir missing or unreadable — fall through to manifest paths only
+        }
+
+        for (const p of clipFiles) {
+            await tryAdd(p);
+        }
+
+        return [...byScene.keys()].sort((a, b) => a - b).map((k) => byScene.get(k)!);
+    }
+
     private async stitchSuccessfulClips(args: {
+        montageDir: string;
         clipFiles: string[];
         outDir: string;
         montageId: string;
@@ -794,7 +946,7 @@ ${header}`,
         partialCombinedFilePath: string | null;
         partialCombinedFileName: string | null;
     }> {
-        const existingClipFiles = await this.collectExistingFiles(args.clipFiles);
+        const existingClipFiles = await this.collectMontageWorkspaceClips(args.montageDir, args.clipFiles);
         if (!existingClipFiles.length) {
             return {
                 stitchedClipCount: 0,
@@ -802,6 +954,10 @@ ${header}`,
                 partialCombinedFileName: null,
             };
         }
+
+        console.log(
+            `[scene-image-montage] partial stitch: combining ${existingClipFiles.length} clip file(s) from workspace.`,
+        );
 
         const partialCombinedFileName = `${args.montageId}_partial_${Date.now()}.mp4`;
         const partialCombinedFilePath = path.join(args.outDir, partialCombinedFileName);
@@ -831,7 +987,11 @@ ${header}`,
     /**
      * content → scenes → shared style brief → keyframe images (folder) → image-to-video per scene → concat (same as montage).
      */
-    async generateSceneImageMontageFromContent(content: string, aspectRatio: "9:16" | "16:9" = "9:16") {
+    async generateSceneImageMontageFromContent(
+        content: string,
+        aspectRatio: "9:16" | "16:9" = "9:16",
+        resume: SceneImageMontageResumeOptions = {},
+    ) {
         console.log("[scene-image-montage] Pipeline start: scene-with-images montage.");
         // Preflight: ffmpeg is only used at the final stitch step, but the whole pipeline is
         // worthless (and expensive) if we only discover it's missing AFTER generating every Veo clip.
@@ -841,11 +1001,18 @@ ${header}`,
         await fs.mkdir(outDir, { recursive: true });
         console.log("[scene-image-montage] Step complete: output directory ready.", outDir);
 
-        const montageId = `montage_img_${Date.now()}`;
+        const resumeMontageId = this.normalizeResumeMontageId(resume.resumeMontageId);
+        const resumeFromScene = this.normalizeResumeFromScene(resume.resumeFromScene);
+        const montageId = resumeMontageId ?? `montage_img_${Date.now()}`;
         const montageDir = path.join(outDir, montageId);
         const imagesDir = path.join(montageDir, "images");
         await fs.mkdir(imagesDir, { recursive: true });
-        console.log("[scene-image-montage] Step complete: montage workspace created.", { montageDir, imagesDir });
+        console.log("[scene-image-montage] Step complete: montage workspace ready.", {
+            montageDir,
+            imagesDir,
+            resumeFromScene,
+            isResume: !!resumeMontageId,
+        });
 
         let failedStep = "initialization";
         let scenes: string[] = [];
@@ -861,6 +1028,11 @@ ${header}`,
             console.log("scenes presently here is ", scenes);
             if (!scenes.length) {
                 throw new Error("No scenes produced from content.");
+            }
+            if (resumeFromScene > scenes.length) {
+                throw new Error(
+                    `resumeFromScene (${resumeFromScene}) is greater than generated scene count (${scenes.length}).`,
+                );
             }
             console.log(
                 `[scene-image-montage] Step complete: video script / scenes generated (count=${scenes.length}).`,
@@ -878,10 +1050,39 @@ ${header}`,
                 path.join(montageDir, `clip_${String(i + 1).padStart(2, "0")}.mp4`),
             );
 
-            console.log(`[scene-image-montage] Phase: generating ${scenes.length} keyframe images...`);
             for (let i = 0; i < scenes.length; i++) {
+                imagePaths[i] = path.join(imagesDir, `scene_${String(i + 1).padStart(2, "0")}.png`);
+            }
+            for (let i = 0; i < scenes.length; i++) {
+                const existing = await this.resolveExistingSceneImagePath(imagesDir, i + 1);
+                if (existing) {
+                    imagePaths[i] = existing;
+                }
+            }
+
+            const anchorPath = imagePaths[0];
+            if (anchorPath && (await this.fileExists(anchorPath))) {
+                const anchorBuf = await fs.readFile(anchorPath);
+                anchorBase64 = anchorBuf.toString("base64");
+                anchorMime = anchorPath.toLowerCase().endsWith(".jpg") || anchorPath.toLowerCase().endsWith(".jpeg")
+                    ? "image/jpeg"
+                    : "image/png";
+                console.log("[scene-image-montage] Reusing first scene image as visual anchor.");
+            }
+
+            console.log(`[scene-image-montage] Phase: generating ${scenes.length} keyframe images...`);
+            for (let i = resumeFromScene - 1; i < scenes.length; i++) {
                 const keyframeStep = `keyframe ${i + 1}/${scenes.length}`;
                 failedStep = keyframeStep;
+
+                const existingImagePath = await this.resolveExistingSceneImagePath(imagesDir, i + 1);
+                if (existingImagePath) {
+                    imagePaths[i] = existingImagePath;
+                    console.log(
+                        `[scene-image-montage] ${keyframeStep}: existing image found, skipping generation -> ${existingImagePath}`,
+                    );
+                    continue;
+                }
 
                 const packed = await this.runStepWithRetries(keyframeStep, async () => {
                     try {
@@ -917,7 +1118,7 @@ ${header}`,
                     packed.mimeType.includes("jpeg") || packed.mimeType.includes("jpg") ? "jpg" : "png";
                 const imagePath = path.join(imagesDir, `scene_${String(i + 1).padStart(2, "0")}.${ext}`);
                 await fs.writeFile(imagePath, Buffer.from(packed.base64, "base64"));
-                imagePaths.push(imagePath);
+                imagePaths[i] = imagePath;
                 console.log(
                     `[scene-image-montage] Step complete: keyframe ${i + 1}/${scenes.length} saved to disk -> ${imagePath}`,
                 );
@@ -926,7 +1127,19 @@ ${header}`,
 
             const ar = aspectRatio as "9:16" | "16:9";
             console.log(`[scene-image-montage] Phase: generating ${scenes.length} Veo clips from keyframes...`);
-            for (let i = 0; i < scenes.length; i++) {
+            for (let i = resumeFromScene - 1; i < scenes.length; i++) {
+                const existingClipBytes = await this.clipFileByteSize(clipFiles[i]);
+                if (existingClipBytes > 0) {
+                    console.log(
+                        `[scene-image-montage] video clip ${i + 1}/${scenes.length}: existing clip found, skipping Veo generation -> ${clipFiles[i]}`,
+                    );
+                    continue;
+                }
+                if (!imagePaths[i] || !(await this.fileExists(imagePaths[i]))) {
+                    throw new Error(
+                        `Missing keyframe image for scene ${i + 1}. Expected an image before generating clip.`,
+                    );
+                }
                 const imageBuf = await fs.readFile(imagePaths[i]);
                 const imageBytes = imageBuf.toString("base64");
                 const mimeType = imagePaths[i].toLowerCase().endsWith(".jpg")
@@ -980,6 +1193,7 @@ ${header}`,
             };
         } catch (err: any) {
             const partial = await this.stitchSuccessfulClips({
+                montageDir,
                 clipFiles,
                 outDir,
                 montageId,

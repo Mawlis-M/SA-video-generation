@@ -114,8 +114,9 @@ export class GeminiController {
   }
 
   /**
-   * Upload a document → extract topics → generate scene breakdowns per topic (via Gemini, no video generation)
-   * → return estimated clip count, scene list, and approximate total video duration.
+   * Upload a document → extract full text → summarize whole document (OpenAI)
+   * → generate scene breakdown from summary (via Gemini, no video generation)
+   * → return estimated clip count and approximate total video duration.
    */
   @Post("estimate-duration")
   @UseInterceptors(
@@ -128,59 +129,41 @@ export class GeminiController {
     @Query("aspectRatio") aspectRatio?: "9:16" | "16:9",
   ) {
     try {
-      const analysis = await this.documentTopics.analyzeTopics(file);
+      if (!file?.buffer?.length) {
+        throw new HttpException(
+          { error: 'Missing file: send multipart form field "file" with a document.' },
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
+      const analysis = await this.documentTopics.summarizeUploadedDocument(
+        file.buffer,
+        file.mimetype,
+        file.originalname,
+      );
       const ar: "9:16" | "16:9" =
         aspectRatio === "16:9" ? "16:9" : "9:16";
 
-      const topicContents = analysis.topics.map((topic) => {
-        const title = (topic.title ?? "").trim();
-        const body = (topic.content ?? "").trim();
-        return title ? `${title}\n\n${body}` : body;
-      });
-
       const VEO_CLIP_DURATION_SECONDS = 8;
-
-      const topicBreakdowns: Array<{
-        topicIndex: number;
-        title: string;
-        sceneCount: number;
-        scenes: string[];
-        estimatedDurationSeconds: number;
-      }> = [];
-
-      let totalScenes = 0;
-
-      for (let i = 0; i < topicContents.length; i++) {
-        const content = topicContents[i];
-        if (!content.trim()) continue;
-
-        console.log(`[estimate-duration] Generating scene breakdown for topic ${i + 1}/${topicContents.length}...`);
-        const scenes = await this.gemini.geminiVideoScript(content);
-        console.log("scenes presently here is ", scenes);
-        console.log(`[estimate-duration] Topic ${i + 1}: ${scenes.length} scenes.`);
-
-        totalScenes += scenes.length;
-        topicBreakdowns.push({
-          topicIndex: i,
-          title: analysis.topics[i]?.title ?? "",
-          sceneCount: scenes.length,
-          scenes,
-          estimatedDurationSeconds: scenes.length * VEO_CLIP_DURATION_SECONDS,
-        });
-      }
+      console.log(
+        `[estimate-duration] Summary generated (chars=${analysis.summaryTextLength}). Generating scenes...`,
+      );
+      const scenes = await this.gemini.geminiVideoScript(analysis.summary);
+      const totalScenes = scenes.length;
 
       const totalDurationSeconds = totalScenes * VEO_CLIP_DURATION_SECONDS;
 
       return {
         originalFileName: analysis.originalFileName,
         extractedTextLength: analysis.extractedTextLength,
-        topicCount: analysis.topics.length,
+        summaryTextLength: analysis.summaryTextLength,
+        summary: analysis.summary,
         aspectRatio: ar,
         totalScenes,
         clipDurationSeconds: VEO_CLIP_DURATION_SECONDS,
         totalEstimatedDurationSeconds: totalDurationSeconds,
         totalEstimatedDurationFormatted: `${Math.floor(totalDurationSeconds / 60)}m ${totalDurationSeconds % 60}s`,
-        topicBreakdowns,
+        scenes,
       };
     } catch (err: any) {
       console.error("[controller estimate-duration] Unhandled error:", err?.message, err?.stack, err);
@@ -192,7 +175,8 @@ export class GeminiController {
   }
 
   /**
-   * Upload a document → extract topics → one POST /gemini/scene-with-images pipeline per topic (sequential).
+   * Upload a document → extract full text → summarize whole document (OpenAI)
+   * → one POST /gemini/scene-with-images pipeline from summary.
    * Optional query: ?aspectRatio=9:16 | 16:9 (default 9:16).
    */
   @Post("document-to-video")
@@ -206,69 +190,47 @@ export class GeminiController {
     @Query("aspectRatio") aspectRatio?: "9:16" | "16:9",
   ) {
     try {
-      const analysis = await this.documentTopics.analyzeTopics(file);
+      if (!file?.buffer?.length) {
+        throw new HttpException(
+          { error: 'Missing file: send multipart form field "file" with a document.' },
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
+      const analysis = await this.documentTopics.summarizeUploadedDocument(
+        file.buffer,
+        file.mimetype,
+        file.originalname,
+      );
       const ar: "9:16" | "16:9" =
         aspectRatio === "16:9" ? "16:9" : "9:16";
-
-      const topicContents = analysis.topics.map((topic) => {
-        const title = (topic.title ?? "").trim();
-        const body = (topic.content ?? "").trim();
-        return title ? `${title}\n\n${body}` : body;
-      });
-
-      type MontageResult = Awaited<
-        ReturnType<GeminiService["generateSceneImageMontageFromContent"]>
-      >;
-      const montagesByTopic: Array<
-        { topicIndex: number; title: string } & MontageResult
-      > = [];
-
-      for (let i = 0; i < topicContents.length; i++) {
-        const content = topicContents[i];
-        console.log("content presently here is ", content);
-        if (!content.trim()) {
-          continue;
-        }
-        console.log(`[document-to-video] Starting montage for topic ${i + 1}...`);
-        try {
-          const montage = await this.gemini.generateSceneImageMontageFromContent(
-            content,
-            ar,
-          );
-          console.log(`[document-to-video] Topic ${i + 1} montage complete.`);
-          montagesByTopic.push({
-            topicIndex: i,
-            title: analysis.topics[i]?.title ?? "",
-            ...montage,
-          });
-        } catch (err: any) {
-          if (err instanceof SceneImageMontageError) {
-            throw new HttpException(
-              {
-                error: "Document to video failed after retries for one topic.",
-                message: err.message,
-                failedTopicIndex: i,
-                failedTopicTitle: analysis.topics[i]?.title ?? "",
-                completedTopics: montagesByTopic,
-                failureDetails: err.details,
-              },
-              HttpStatus.BAD_GATEWAY,
-            );
-          }
-          throw err;
-        }
-      }
+      console.log(
+        `[document-to-video] Summary generated (chars=${analysis.summaryTextLength}). Starting single montage...`,
+      );
+      const montage = await this.gemini.generateSceneImageMontageFromContent(
+        analysis.summary,
+        ar,
+      );
 
       return {
         originalFileName: analysis.originalFileName,
         extractedTextLength: analysis.extractedTextLength,
-        topicCount: analysis.topics.length,
-        topics: analysis.topics,
-        topicContents,
+        summaryTextLength: analysis.summaryTextLength,
+        summary: analysis.summary,
         aspectRatio: ar,
-        montagesByTopic,
+        montage,
       };
     } catch (err: any) {
+      if (err instanceof SceneImageMontageError) {
+        throw new HttpException(
+          {
+            error: "Document to video failed while generating montage from summary.",
+            message: err.message,
+            failureDetails: err.details,
+          },
+          HttpStatus.BAD_GATEWAY,
+        );
+      }
       if (err instanceof HttpException) {
         throw err;
       }
