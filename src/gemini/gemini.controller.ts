@@ -115,8 +115,14 @@ export class GeminiController {
 
   /**
    * Upload a document → extract full text → summarize whole document (OpenAI)
-   * → generate scene breakdown from summary (via Gemini, no video generation)
-   * → return estimated clip count and approximate total video duration.
+   * → generate the SAME duration-aware scene+narration plan that `/document-to-video`
+   *   would produce (no images, no Veo, no FFmpeg)
+   * → return per-scene durations, per-scene `clipsNeeded`, total Veo clip count, and
+   *   the trimmed final video length so callers can show an accurate estimate before
+   *   committing to the full montage run.
+   *
+   * The numbers returned here match the real pipeline because both endpoints share
+   * `GeminiService.planDurationAwareScenesFromContent` under the hood.
    */
   @Post("estimate-duration")
   @UseInterceptors(
@@ -146,12 +152,26 @@ export class GeminiController {
 
       const VEO_CLIP_DURATION_SECONDS = 8;
       console.log(
-        `[estimate-duration] Summary generated (chars=${analysis.summaryTextLength}). Generating scenes...`,
+        `[estimate-duration] Summary generated (chars=${analysis.summaryTextLength}). Generating duration-aware scene plan...`,
       );
-      const scenes = await this.gemini.geminiVideoScript(analysis.summary);
-      const totalScenes = scenes.length;
 
-      const totalDurationSeconds = totalScenes * VEO_CLIP_DURATION_SECONDS;
+      // Same call the real /document-to-video orchestrator makes when there is no
+      // resumeable plan on disk — so the response below matches the pipeline 1:1.
+      const scenes = await this.gemini.planDurationAwareScenesFromContent(analysis.summary);
+
+      const totalScenes = scenes.length;
+      const totalClipsNeeded = scenes.reduce((sum, s) => sum + s.clipsNeeded, 0);
+      // Sum of trimmed per-scene durations = the length of the final stitched video.
+      const totalEstimatedDurationSeconds = scenes.reduce(
+        (sum, s) => sum + s.audioDurationSeconds,
+        0,
+      );
+      // Sum of raw 8s Veo clips before trimming = useful for cost / time-to-render estimates,
+      // since each Veo clip is billed and rendered as a full 8 seconds even when later trimmed.
+      const totalRawVeoBudgetSeconds = totalClipsNeeded * VEO_CLIP_DURATION_SECONDS;
+
+      const formatMmSs = (s: number) =>
+        `${Math.floor(s / 60)}m ${s % 60}s`;
 
       return {
         originalFileName: analysis.originalFileName,
@@ -160,9 +180,17 @@ export class GeminiController {
         summary: analysis.summary,
         aspectRatio: ar,
         totalScenes,
+        totalClipsNeeded,
         clipDurationSeconds: VEO_CLIP_DURATION_SECONDS,
-        totalEstimatedDurationSeconds: totalDurationSeconds,
-        totalEstimatedDurationFormatted: `${Math.floor(totalDurationSeconds / 60)}m ${totalDurationSeconds % 60}s`,
+        // Final stitched video length (after per-scene trim to narration duration).
+        totalEstimatedDurationSeconds,
+        totalEstimatedDurationFormatted: formatMmSs(totalEstimatedDurationSeconds),
+        // Pre-trim Veo budget (clipsNeeded × 8s). Use this for cost / render-time estimates.
+        totalRawVeoBudgetSeconds,
+        totalRawVeoBudgetFormatted: formatMmSs(totalRawVeoBudgetSeconds),
+        // Full PlannedScene[] so the caller can preview per-scene narration, durations, and clip
+        // counts. `referenceImages` is intentionally empty here — image generation only happens
+        // during the real /document-to-video run.
         scenes,
       };
     } catch (err: any) {
@@ -188,6 +216,12 @@ export class GeminiController {
   async documentToVideo(
     @UploadedFile() file: Express.Multer.File,
     @Query("aspectRatio") aspectRatio?: "9:16" | "16:9",
+    // Optional resume params: when a long run dies (server crash, dev-server restart, etc.)
+    // the workspace at generated-document-to-video/<montageId>/ already contains every
+    // finished image / clip / stitched scene. Re-POST with ?resumeMontageId=<id> (and
+    // optionally &resumeFromScene=N) to skip everything that's already on disk.
+    @Query("resumeMontageId") resumeMontageId?: string,
+    @Query("resumeFromScene") resumeFromScene?: string,
   ) {
     try {
       if (!file?.buffer?.length) {
@@ -204,12 +238,38 @@ export class GeminiController {
       );
       const ar: "9:16" | "16:9" =
         aspectRatio === "16:9" ? "16:9" : "9:16";
+
+      const parsedResumeFromScene =
+        resumeFromScene != null && resumeFromScene !== ""
+          ? Number(resumeFromScene)
+          : undefined;
+      if (
+        parsedResumeFromScene != null &&
+        (!Number.isFinite(parsedResumeFromScene) || parsedResumeFromScene < 1)
+      ) {
+        throw new HttpException(
+          { error: "resumeFromScene must be a positive integer (1-based)." },
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
       console.log(
-        `[document-to-video] Summary generated (chars=${analysis.summaryTextLength}). Starting single montage...`,
+        `[document-to-video] Summary generated (chars=${analysis.summaryTextLength}). Starting duration-aware montage...`,
+        resumeMontageId
+          ? { resumeMontageId, resumeFromScene: parsedResumeFromScene ?? 1 }
+          : { resumeMontageId: null },
       );
-      const montage = await this.gemini.generateSceneImageMontageFromContent(
+      // Switched from generateSceneImageMontageFromContent (1 clip per scene, hard 8s limit)
+      // to the duration-aware pipeline from APPROACH.md: each scene now spans ceil(audio/8)
+      // chained Veo clips, then is concat-and-trimmed to its narration duration so long scenes
+      // no longer break mid-narration.
+      const montage = await this.gemini.generateDurationAwareVideoFromContent(
         analysis.summary,
         ar,
+        {
+          resumeMontageId,
+          resumeFromScene: parsedResumeFromScene,
+        },
       );
 
       return {

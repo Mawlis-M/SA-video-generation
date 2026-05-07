@@ -54,3 +54,9 @@ pids
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Pipeline outputs (large mp4 / png artifacts; not source).
+# Tracking these makes git, IDE indexers, and search plugins react to every Veo
+# download and ffmpeg write, which can also trigger spurious dev-server restarts.
+/generated
+/generated-document-to-video
