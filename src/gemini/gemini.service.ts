@@ -61,6 +61,7 @@ export interface StitchedScene {
     sceneId: string;
     sceneIndex: number;
     videoPath: string;
+    /** Stitched scene duration in seconds (ffprobe when available; else narration estimate). */
     trimmedDurationSeconds: number;
 }
 
@@ -1493,72 +1494,48 @@ Output Example:
         return lastFramePath;
     }
 
-    /**
-     * Trim a clip to exact duration. Stream-copy first (fast, snaps to keyframe); on failure, fall
-     * back to a re-encode trim for frame-accurate output. Matches APPROACH.md's stitch step intent.
-     */
-    private async trimClipFFmpeg(
-        inputPath: string,
-        durationSeconds: number,
-        outputPath: string,
-    ): Promise<void> {
-        const runFfmpeg = (args: string[]) =>
-            new Promise<void>((resolve, reject) => {
-                const ff = spawn("ffmpeg", args, { stdio: "pipe" });
-                let stderr = "";
-                ff.stderr.on("data", (d) => (stderr += d.toString()));
-                ff.on("error", (err) => reject(err));
-                ff.on("close", (code) => {
-                    if (code === 0) return resolve();
-                    reject(new Error(`ffmpeg trim failed (code=${code}). Details:\n${stderr}`));
-                });
+    /** Returns container duration in seconds, or null if ffprobe is missing or fails. */
+    private async probeVideoDurationSeconds(videoPath: string): Promise<number | null> {
+        return await new Promise((resolve) => {
+            const pr = spawn("ffprobe", [
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                videoPath,
+            ]);
+            let out = "";
+            let err = "";
+            pr.stdout?.on("data", (d: Buffer) => (out += d.toString()));
+            pr.stderr?.on("data", (d: Buffer) => (err += d.toString()));
+            pr.on("error", () => resolve(null));
+            pr.on("close", (code) => {
+                if (code !== 0) {
+                    if (err.trim()) console.warn(`[duration-aware-video] ffprobe failed: ${err.trim()}`);
+                    return resolve(null);
+                }
+                const n = parseFloat(out.trim());
+                resolve(Number.isFinite(n) && n > 0 ? n : null);
             });
-
-        try {
-            await runFfmpeg([
-                "-y",
-                "-i", inputPath,
-                "-t", String(durationSeconds),
-                "-c", "copy",
-                outputPath,
-            ]);
-        } catch {
-            await runFfmpeg([
-                "-y",
-                "-i", inputPath,
-                "-t", String(durationSeconds),
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-c:a", "aac",
-                "-movflags", "+faststart",
-                outputPath,
-            ]);
-        }
+        });
     }
 
     /**
-     * Per-scene stitch + trim: concatenate the scene's N Veo clips, then hard-trim to the scene's
-     * narration duration. Single-clip scenes are trimmed directly (no concat needed).
+     * Per-scene stitch: concatenate Veo clips at their generated length. We intentionally do not
+     * trim to `audioDurationSeconds` here — the script-based estimate can be shorter than real
+     * narration on the clips, which was cutting the tail (last words) off the stitched scene.
      */
-    private async stitchAndTrimSceneClips(
-        clipPaths: string[],
-        trimDurationSeconds: number,
-        outputPath: string,
-    ): Promise<void> {
+    private async stitchSceneClips(clipPaths: string[], outputPath: string): Promise<void> {
         if (clipPaths.length === 1) {
-            await this.trimClipFFmpeg(clipPaths[0], trimDurationSeconds, outputPath);
+            await fs.copyFile(clipPaths[0], outputPath);
             return;
         }
-        const concatPath = outputPath.replace(/\.mp4$/i, "_concat.mp4");
         try {
-            await this.concatClipsFFmpeg(clipPaths, concatPath);
+            await this.concatClipsFFmpeg(clipPaths, outputPath);
         } catch {
-            await this.concatClipsFFmpegReencode(clipPaths, concatPath);
-        }
-        try {
-            await this.trimClipFFmpeg(concatPath, trimDurationSeconds, outputPath);
-        } finally {
-            await fs.unlink(concatPath).catch(() => { });
+            await this.concatClipsFFmpegReencode(clipPaths, outputPath);
         }
     }
 
@@ -1667,7 +1644,7 @@ Output Example:
      * content → scenes(description+script) → planned scenes (with audio duration & clipsNeeded)
      *   → shared style brief → N keyframe images per scene
      *   → N Veo clips per scene with last-frame chaining
-     *   → per-scene concat + trim to narration duration
+     *   → per-scene concat at full Veo clip length (no hard trim to narration estimate)
      *   → final concat of all stitched scenes.
      *
      * Mirrors the structure / logging / retry / partial-recovery semantics of
@@ -1741,6 +1718,7 @@ Output Example:
                     "utf8",
                 );
             }
+            console.log("[duration-aware-video] the scenes are ", scenes);
             if (resumeFromScene > scenes.length) {
                 throw new Error(
                     `resumeFromScene (${resumeFromScene}) is greater than planned scene count (${scenes.length}).`,
@@ -1778,7 +1756,7 @@ Output Example:
             console.log(
                 `[duration-aware-video] Phase: generating ${totalClips} keyframe images across ${scenes.length} scenes...`,
             );
-            for (let i = 0; i < 5; i++) {
+            for (let i = 0; i < scenes.length; i++) {
                 const scene = scenes[i];
                 const labels = this.frameLabelsForClipCount(scene.clipsNeeded);
                 const referenceImages: string[] = [];
@@ -1881,6 +1859,35 @@ Output Example:
                 const sceneClipFiles: string[] = [];
                 let previousLastFramePath: string | undefined;
 
+                const sanitizeForQuotedDialogue = (s: string) =>
+                    s
+                        .replace(/\s+/g, " ")
+                        .replace(/["“”]/g, "'")
+                        .trim();
+
+                const splitNarrationIntoClipSegments = (script: string, clipCount: number): string[] => {
+                    const clean = sanitizeForQuotedDialogue(script);
+                    if (!clean) return Array.from({ length: clipCount }, () => "");
+                    if (clipCount <= 1) return [clean];
+
+                    const words = clean.split(" ").filter(Boolean);
+                    if (words.length <= clipCount) {
+                        // Not enough words to split meaningfully; keep it in the first clip.
+                        return [clean, ...Array.from({ length: clipCount - 1 }, () => "")];
+                    }
+
+                    const segments: string[] = [];
+                    for (let idx = 0; idx < clipCount; idx++) {
+                        const start = Math.floor((idx * words.length) / clipCount);
+                        const end = Math.floor(((idx + 1) * words.length) / clipCount);
+                        const part = words.slice(start, end).join(" ").trim();
+                        segments.push(part);
+                    }
+                    return segments;
+                };
+
+                const narrationSegments = splitNarrationIntoClipSegments(scene.script ?? "", scene.clipsNeeded);
+
                 for (let c = 0; c < scene.clipsNeeded; c++) {
                     const clipPath = path.join(
                         sceneClipDir,
@@ -1926,7 +1933,7 @@ Output Example:
                     const imageBytes = imageBuf.toString("base64");
                     const mimeType =
                         startImagePath.toLowerCase().endsWith(".jpg") ||
-                        startImagePath.toLowerCase().endsWith(".jpeg")
+                            startImagePath.toLowerCase().endsWith(".jpeg")
                             ? "image/jpeg"
                             : "image/png";
 
@@ -1934,7 +1941,17 @@ Output Example:
                         ? "Open this scene with cinematic motion that establishes the situation."
                         : `This is clip ${c + 1} of ${scene.clipsNeeded} for the same continuous scene. The provided image is the FINAL frame of the previous clip — continue the same shot without cutting, jumping, or changing subjects, wardrobe, props, environment, or camera angle. Pick up motion exactly where it left off.`;
 
-                    const videoPrompt = `Scene ${i + 1} of ${scenes.length}, clip ${c + 1} of ${scene.clipsNeeded}. ${continuityHint} Maintain consistent characters, wardrobe, props, environment, and lighting throughout. ${scene.description}`;
+                    const narration = narrationSegments[c] ?? "";
+                    const audioHint = narration
+                        ? `\n\nAudio / voice-over cues:\n- Narrator (calm instructional voice-over, neutral accent): "${narration}"`
+                        : `\n\nAudio / voice-over cues:\n- No dialogue. Ambient room tone only.`;
+
+                    const videoPrompt =
+                        `Scene ${i + 1} of ${scenes.length}, clip ${c + 1} of ${scene.clipsNeeded}.\n` +
+                        `${continuityHint}\n` +
+                        `Maintain consistent characters, wardrobe, props, environment, and lighting throughout.\n\n` +
+                        `Visual:\n${scene.description}` +
+                        audioHint;
 
                     failedStep = `video clip ${clipLabel}`;
                     console.log(`[duration-aware-video] Starting Veo ${clipLabel}...`);
@@ -1963,7 +1980,7 @@ Output Example:
                     }
                 }
 
-                // Stitch (concat + trim) per-scene video.
+                // Stitch per-scene video (full concat length; no hard trim to narration estimate).
                 failedStep = `stitch scene ${i + 1}/${scenes.length}`;
                 const existingStitchedBytes = await this.clipFileByteSize(stitchedScenePath);
                 if (existingStitchedBytes > 0) {
@@ -1972,15 +1989,19 @@ Output Example:
                     );
                 } else {
                     console.log(
-                        `[duration-aware-video] Stitching scene ${i + 1}/${scenes.length}: ${sceneClipFiles.length} clip(s) -> trim to ${scene.audioDurationSeconds}s.`,
+                        `[duration-aware-video] Stitching scene ${i + 1}/${scenes.length}: ${sceneClipFiles.length} clip(s) (no narration-duration trim).`,
                     );
-                    await this.stitchAndTrimSceneClips(
-                        sceneClipFiles,
-                        scene.audioDurationSeconds,
-                        stitchedScenePath,
-                    );
+                    await this.stitchSceneClips(sceneClipFiles, stitchedScenePath);
                     console.log(
                         `[duration-aware-video] Step complete: scene ${i + 1}/${scenes.length} stitched -> ${stitchedScenePath}`,
+                    );
+                }
+
+                const probedDuration = await this.probeVideoDurationSeconds(stitchedScenePath);
+                const sceneVideoDurationSeconds = probedDuration ?? scene.audioDurationSeconds;
+                if (probedDuration == null) {
+                    console.warn(
+                        `[duration-aware-video] scene ${i + 1}/${scenes.length}: ffprobe duration unavailable; using narration estimate ${scene.audioDurationSeconds}s for totals.`,
                     );
                 }
 
@@ -1988,7 +2009,7 @@ Output Example:
                     sceneId: scene.id,
                     sceneIndex: scene.sceneIndex,
                     videoPath: stitchedScenePath,
-                    trimmedDurationSeconds: scene.audioDurationSeconds,
+                    trimmedDurationSeconds: sceneVideoDurationSeconds,
                 });
             }
             console.log("[duration-aware-video] Phase complete: all per-scene videos stitched.");
